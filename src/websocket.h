@@ -121,6 +121,10 @@ void websocket_reset_metrics(WebSocket* ws);
 
 // PHASE 2: Observability - Health check API
 WSHealthStatus websocket_get_health(WebSocket* ws);
+
+// Diagnostic tracking (for throughput investigation)
+void websocket_get_diagnostics(WebSocket* ws, uint64_t* ssl_bytes_read, uint64_t* ssl_read_calls, 
+                                uint64_t* frames_parsed, uint64_t* frames_processed);
 void websocket_set_on_health(WebSocket* ws, ws_on_health_t callback, void* user_data);
 
 // PHASE 2: Observability - Logging API

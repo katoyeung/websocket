@@ -12,10 +12,12 @@
 #include <ctype.h>
 #include <sys/socket.h>
 #include <sys/event.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <openssl/sha.h>
 #include <openssl/bio.h>
@@ -29,7 +31,6 @@ static void update_latency_sample(WebSocket* ws, uint64_t latency_ns);
 static void check_health(WebSocket* ws);
 static void report_metrics_if_needed(WebSocket* ws);
 static void check_heartbeat(WebSocket* ws);
-static void trigger_reconnect(WebSocket* ws);
 
 // PHASE 2: Observability - Logging macro helper
 #define WS_LOG(ws, level, fmt, ...) \
@@ -100,6 +101,12 @@ struct WebSocket {
     // Error tracking
     uint32_t frame_parse_errors;  // Count of frame parse errors
     
+    // Diagnostic counters for throughput investigation
+    uint64_t ssl_bytes_read_total;      // Total bytes read from SSL
+    uint64_t ssl_read_calls;            // Number of SSL read calls
+    uint64_t frames_parsed_total;       // Total frames successfully parsed
+    uint64_t frames_processed_total;    // Total frames processed (including errors)
+    
     // PHASE 2: Observability - Metrics tracking
     WebSocketMetrics metrics;
     uint64_t metrics_last_report_ns;  // Last time metrics were reported
@@ -122,7 +129,6 @@ struct WebSocket {
     // PHASE 2: Observability - Health state
     WSHealthStatus current_health;
     uint64_t last_health_check_ns;
-    uint64_t last_metric_reset_ns;  // PRIORITY 1: Track last metric reset time
     
     // PHASE 3: Error Recovery - Reconnection state
     WSReconnectConfig reconnect_config;
@@ -278,9 +284,19 @@ static int tcp_connect(const char* host, int port) {
     }
     
     int fd = -1;
+    const int connect_timeout_sec = 10;  // 10 second timeout
+    
     for (rp = result; rp != NULL; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd == -1) {
+            continue;
+        }
+        
+        // Set socket to non-blocking for timeout support
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            close(fd);
+            fd = -1;
             continue;
         }
         
@@ -296,9 +312,40 @@ static int tcp_connect(const char* host, int port) {
         setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp_on, sizeof(timestamp_on));
         #endif
         
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+        // Attempt connection (non-blocking)
+        int connect_result = connect(fd, rp->ai_addr, rp->ai_addrlen);
+        if (connect_result == 0) {
+            // Connected immediately - keep non-blocking (I/O code expects non-blocking)
             break;  // Success
         }
+        
+        if (errno == EINPROGRESS) {
+            // Connection in progress - wait for completion with timeout
+            fd_set write_fds;
+            FD_ZERO(&write_fds);
+            FD_SET(fd, &write_fds);
+            
+            struct timeval timeout;
+            timeout.tv_sec = connect_timeout_sec;
+            timeout.tv_usec = 0;
+            
+            int select_result = select(fd + 1, NULL, &write_fds, NULL, &timeout);
+            if (select_result > 0 && FD_ISSET(fd, &write_fds)) {
+                // Check if connection succeeded
+                int socket_error = 0;
+                socklen_t len = sizeof(socket_error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &len) == 0 && socket_error == 0) {
+                    // Connection successful - keep non-blocking (I/O code expects non-blocking)
+                    break;  // Success
+                }
+            }
+            // Connection failed or timed out
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        
+        // Other error - try next address
         close(fd);
         fd = -1;
     }
@@ -491,6 +538,7 @@ static void process_frames(WebSocket* ws) {
             // Parse error - skip one byte and try again (to recover from corruption)
             ws->frame_parse_errors++;
             ws->metrics.errors_total++;  // PHASE 2: Track error count
+            ws->frames_processed_total++;  // Track processed (including errors)
             WS_LOG(ws, WS_LOG_WARN, "Frame parse error at offset %zu", offset);
             offset++;
             continue;
@@ -501,9 +549,14 @@ static void process_frames(WebSocket* ws) {
         if (frame_size == 0 || frame_size > len - offset) {
             // Invalid frame size - skip one byte and try again
             ws->frame_parse_errors++;
+            ws->frames_processed_total++;  // Track processed (including errors)
             offset++;
             continue;
         }
+        
+        // Frame successfully parsed - increment counters
+        ws->frames_parsed_total++;
+        ws->frames_processed_total++;
         
         // Assign payload pointer to point to payload in ringbuffer
         frame->payload = (uint8_t*)(data + offset + frame->header_size);
@@ -609,7 +662,6 @@ WebSocket* websocket_create(void) {
     ws->log_user_data = NULL;
     ws->current_health = WS_HEALTH_OK;
     ws->last_health_check_ns = 0;
-    ws->last_metric_reset_ns = 0;
     
     // PHASE 3: Initialize error recovery
     memset(&ws->reconnect_config, 0, sizeof(WSReconnectConfig));
@@ -762,6 +814,9 @@ int websocket_connect(WebSocket* ws, const char* url, bool disable_cert_validati
             ws->ssl_ctx = NULL;
             goto cleanup;
         }
+        
+        // Set user_data in SSL context for diagnostic tracking
+        ssl_set_user_data(ws->ssl_ctx, ws);
     }
     
     // Add socket to I/O context
@@ -963,8 +1018,12 @@ int websocket_process(WebSocket* ws) {
     }
     
     struct kevent events[IO_MAX_SOCKETS];
-    // Use 10µs timeout for HFT optimization (balances responsiveness and CPU usage)
-    int event_count = io_poll(ws->io_ctx, events, IO_MAX_SOCKETS, 10);
+    // CRITICAL: Use 0 timeout for maximum responsiveness - kqueue returns immediately
+    // When kqueue reports readable, we drain ultra-aggressively (50k+ SSL reads)
+    // Between events, we always read to catch SecureTransport's buffered data
+    // Zero timeout ensures we never block and can process immediately
+    int timeout_us = ws->use_ssl ? 0 : 10;  // 0 for SSL (non-blocking), 10μs for non-SSL
+    int event_count = io_poll(ws->io_ctx, events, IO_MAX_SOCKETS, timeout_us);
     
     if (event_count < 0) {
         return -1;
@@ -991,9 +1050,114 @@ int websocket_process(WebSocket* ws) {
             // For non-SSL, io_read() captures NIC timestamp
             // For SSL, SecureTransport reads internally, so timestamp capture is limited
             if (ws->use_ssl) {
-                // SSL reads from socket internally via SecureTransport
-                // Timestamp capture is handled within ssl_read via recvmsg()
-                ssl_read(ws->ssl_ctx, &ws->rx_ring);
+                // CRITICAL: When kqueue reports socket is readable, drain SSL ULTRA-aggressively
+                // SecureTransport buffers data internally, so we need to read many times
+                // Strategy: Read continuously until we get no data for multiple attempts
+                
+                // CRITICAL: Process frames BEFORE draining to free ring buffer space
+                // This ensures we have maximum space available for SSL reads
+                process_frames(ws);
+                
+                int ssl_drain_attempts = 0;
+                const int max_ssl_drain = 50000;  // Ultra-aggressive: 50,000 drain attempts
+                int consecutive_would_block = 0;
+                const int max_consecutive_would_block = 500;  // Stop after 500 consecutive would-blocks
+                bool made_progress = false;
+                
+                // CRITICAL: Process frames once before starting drain to free initial space
+                process_frames(ws);
+                
+                // CRITICAL: kqueue already told us socket is readable (EVFILT_READ event)
+                // Trust kqueue and drain aggressively - SecureTransport may have buffered data
+                while (ssl_drain_attempts < max_ssl_drain && ws->state == WS_STATE_CONNECTED) {
+                    ssl_drain_attempts++;
+                    ssize_t ssl_result = ssl_read(ws->ssl_ctx, &ws->rx_ring);
+                    
+                    // Update diagnostic counters
+                    if (ws->ssl_ctx) {
+                        ws->ssl_bytes_read_total = ssl_get_bytes_read(ws->ssl_ctx);
+                        ws->ssl_read_calls = ssl_get_read_calls(ws->ssl_ctx);
+                    }
+                    
+                    if (ssl_result > 0) {
+                        // Got data - reset would-block counter and process frames immediately
+                        made_progress = true;
+                        consecutive_would_block = 0;  // Reset counter
+                        
+                        // Process frames immediately to free buffer space
+                        process_frames(ws);
+                        
+                        // Drain all frames aggressively to free maximum buffer space
+                        int frame_iterations = 0;
+                        while (frame_iterations < 500 && ws->state == WS_STATE_CONNECTED) {
+                            size_t before = ws->rx_ring.read_ptr;
+                            process_frames(ws);
+                            size_t after = ws->rx_ring.read_ptr;
+                            if (after == before) {
+                                break;
+                            }
+                            frame_iterations++;
+                        }
+                        
+                        // Continue draining SSL - we're getting data
+                        continue;
+                    } else if (ssl_result == -2) {
+                        // Ring buffer full - process frames to free space
+                        made_progress = true;
+                        process_frames(ws);
+                        
+                        // CRITICAL: Drain ALL frames aggressively before continuing SSL reads
+                        // This frees maximum buffer space for SecureTransport
+                        int frame_iterations = 0;
+                        while (frame_iterations < 1000 && ws->state == WS_STATE_CONNECTED) {
+                            size_t before = ws->rx_ring.read_ptr;
+                            process_frames(ws);
+                            size_t after = ws->rx_ring.read_ptr;
+                            if (after == before) {
+                                break;
+                            }
+                            frame_iterations++;
+                        }
+                        
+                        // Continue draining after freeing space
+                        continue;
+                    } else if (ssl_result == 0) {
+                        // Would-block - track consecutive would-blocks
+                        consecutive_would_block++;
+                        
+                        // CRITICAL: Continue draining aggressively even after would-block
+                        // SecureTransport may buffer data and make it available later
+                        // Process frames before continuing to free buffer space
+                        process_frames(ws);
+                        
+                        // Only stop after many consecutive would-blocks
+                        // CRITICAL: Continue draining even after would-block if we made progress
+                        // SecureTransport may buffer data and make it available later
+                        if (consecutive_would_block < max_consecutive_would_block) {
+                            // If we made progress, reset counter and keep trying longer
+                            if (made_progress) {
+                                // Reset counter to allow more attempts after progress
+                                if (consecutive_would_block < 200) {
+                                    consecutive_would_block = 0;  // Reset, keep trying aggressively
+                                }
+                            }
+                            continue;  // Keep trying - SecureTransport may have more data
+                        }
+                        
+                        // Too many consecutive would-blocks - likely no more data
+                        // Process any remaining frames and stop
+                        process_frames(ws);
+                        break;
+                    } else {
+                        // Error - stop draining
+                        break;
+                    }
+                }
+                
+                // CRITICAL: After aggressive draining, process any remaining frames
+                // Level-triggered events will fire again if socket is still readable
+                // Process frames one more time to catch anything that arrived during draining
+                process_frames(ws);
             } else {
                 io_read(ws->io_ctx, socket_idx);
             }
@@ -1006,7 +1170,7 @@ int websocket_process(WebSocket* ws) {
                     // Drive SSL handshake by reading/writing - loop until complete
                     // SecureTransport handshake is asynchronous and needs multiple I/O cycles
                     int ssl_handshake_iterations = 0;
-                    const int max_ssl_iterations = 20;  // Max iterations per event
+                    const int max_ssl_iterations = 50;  // Increased from 20 to 50 for more reliable handshake
                     bool ssl_made_progress = false;
                     
                     while (ssl_handshake_iterations < max_ssl_iterations) {
@@ -1033,19 +1197,25 @@ int websocket_process(WebSocket* ws) {
                         if (ssl_read_result == 0 && ssl_write_result == 0) {
                             // No progress this iteration
                             // For SecureTransport, assume handshake can proceed if we've made progress before
-                            if (ssl_made_progress || ssl_handshake_iterations >= 5) {
+                            if (ssl_made_progress || ssl_handshake_iterations >= 10) {
                                 break;  // Assume handshake will complete via subsequent I/O
                             }
+                            // Wait a bit before next iteration
+                            usleep(10000);  // 10ms
+                            continue;
                         }
                         
                         // If error, don't fail immediately - might be temporary
                         if (ssl_read_result < 0 || ssl_write_result < 0) {
                             // SSL error - but don't close immediately
                             // SecureTransport may return errors during handshake that are recoverable
-                            if (ssl_handshake_iterations >= 10) {
+                            if (ssl_handshake_iterations >= 20) {
                                 // Too many errors - likely real failure
                                 break;
                             }
+                            // Wait before retry
+                            usleep(10000);  // 10ms
+                            continue;
                         }
                     }
                 }
@@ -1133,88 +1303,92 @@ int websocket_process(WebSocket* ws) {
         }
     }
     
-    // CRITICAL: For SSL connections, keep reading even when no socket events
-    // SecureTransport may buffer data internally, so we need to actively drain it
-    // This ensures we process all available data immediately, not waiting for kqueue events
+    // CRITICAL: For SSL connections, use hybrid approach
+    // 1. Ultra-aggressive draining when kqueue reports readable (EVFILT_READ handler)
+    // 2. Occasional reads between events to catch SecureTransport's buffered data
+    // SecureTransport buffers data internally, so we need to read periodically
     if (ws->state == WS_STATE_CONNECTED && ws->use_ssl) {
-        // Keep reading from SSL and processing frames until no more data available
-        // IMPORTANT: Must be aggressive about draining - Binance sends messages continuously
-        // BUT: Check connection state to detect if connection closed
-        int ssl_read_attempts = 0;
-        const int max_ssl_reads = 200;  // Increased from 100 to handle high message rates
-        bool made_progress = false;
+        // CRITICAL: Always read SSL aggressively when no kqueue events - catch SecureTransport buffered data
+        // With 0 timeout kqueue, we can call very frequently
+        // When kqueue reports readable, we drain 50k+ times in EVFILT_READ handler
+        // Between events, we need to read MANY times to catch all buffered data
         
-        while (ssl_read_attempts < max_ssl_reads && ws->state == WS_STATE_CONNECTED) {
-            ssl_read_attempts++;
+        // Process frames first to free buffer space
+        process_frames(ws);
+        
+        // ULTRA-AGGRESSIVE: Read SSL multiple times even when no events
+        // SecureTransport buffers data internally, so we need to read many times
+        // This is critical for maximum throughput - don't just read once!
+        // CRITICAL: Even when kqueue reports no events, SecureTransport may have buffered data
+        // Read aggressively to catch all buffered data - this is key for high throughput
+        int no_event_reads = 0;
+        const int max_no_event_reads = 2000;  // Read up to 2000 times when no events (aggressive)
+        int consecutive_would_block_no_event = 0;
+        const int max_consecutive_would_block_no_event = 100;  // Stop after 100 consecutive would-blocks
+        
+        while (no_event_reads < max_no_event_reads && ws->state == WS_STATE_CONNECTED) {
             ssize_t ssl_result = ssl_read(ws->ssl_ctx, &ws->rx_ring);
             
-            // Check connection state after each read (connection might have closed)
-            if (ws->state != WS_STATE_CONNECTED) {
-                // Connection closed during drain - process any buffered frames and exit
-                process_frames(ws);
-                break;
+            // Update diagnostic counters
+            if (ws->ssl_ctx) {
+                ws->ssl_bytes_read_total = ssl_get_bytes_read(ws->ssl_ctx);
+                ws->ssl_read_calls = ssl_get_read_calls(ws->ssl_ctx);
             }
             
             if (ssl_result > 0) {
-                // Data was read - process frames immediately
-                made_progress = true;
+                // Got data - reset counters and process immediately
+                consecutive_would_block_no_event = 0;
                 process_frames(ws);
-                // Continue draining frames until buffer is empty
-                int frame_drain_iterations = 0;
-                while (frame_drain_iterations < 50 && ws->state == WS_STATE_CONNECTED) {
+                
+                // Drain frames aggressively to free buffer space
+                int frame_iter = 0;
+                while (frame_iter < 500 && ws->state == WS_STATE_CONNECTED) {
                     size_t before = ws->rx_ring.read_ptr;
                     process_frames(ws);
                     size_t after = ws->rx_ring.read_ptr;
-                    if (after == before) {
-                        break;  // No more frames to process
-                    }
-                    // Check state again after processing frames
-                    if (ws->state != WS_STATE_CONNECTED) {
-                        break;
-                    }
-                    frame_drain_iterations++;
+                    if (after == before) break;
+                    frame_iter++;
                 }
+                
+                // Reset counter - we're getting data, keep going
+                no_event_reads = 0;
+                continue;
             } else if (ssl_result == 0) {
-                // No more data available (would block) - connection is still alive
+                // Would-block - track consecutive would-blocks
+                consecutive_would_block_no_event++;
+                // Process frames before continuing (might have partial frames)
                 process_frames(ws);
                 
-                // If we made progress this loop, continue one more time to catch any buffered data
-                if (made_progress && ssl_read_attempts < 5) {
+                // Try many more times before giving up
+                if (consecutive_would_block_no_event < max_consecutive_would_block_no_event) {
+                    no_event_reads++;
                     continue;
                 }
-                
-                break;  // No more data available (would block)
-            } else if (ssl_result < 0) {
-                // CRITICAL: Negative result means connection closed or error
-                // ssl_read returns -1 for connection closure (errSSLClosedGraceful)
-                // Update connection state immediately
-                if (ws->state == WS_STATE_CONNECTED) {
-                    ws->state = WS_STATE_CLOSED;
-                    // Trigger error callback for reconnect handling
-                    if (ws->on_error) {
-                        ws->on_error(ws, -1, "SSL connection closed", ws->callback_user_data);
-                    }
-                }
-                process_frames(ws);  // Process any remaining buffered frames
-                break;  // Connection closed
-            } else {
-                // This shouldn't happen (ssl_result < 0 is handled above)
-                // But handle it anyway for safety
+                break;
+            } else if (ssl_result == -2) {
+                // Ring buffer full - process frames aggressively
+                consecutive_would_block_no_event = 0;
                 process_frames(ws);
-                if (ws->state != WS_STATE_CONNECTED) {
-                    break;
+                
+                // Drain frames to free maximum space
+                int frame_iter = 0;
+                while (frame_iter < 1000 && ws->state == WS_STATE_CONNECTED) {
+                    size_t before = ws->rx_ring.read_ptr;
+                    process_frames(ws);
+                    size_t after = ws->rx_ring.read_ptr;
+                    if (after == before) break;
+                    frame_iter++;
                 }
+                // Reset counter - freed space, keep going
+                no_event_reads = 0;
+                continue;
+            } else {
+                // Error - stop
                 break;
             }
         }
-        
-        // Final frame processing pass to catch any remaining frames (if still connected)
-        if (ws->state == WS_STATE_CONNECTED) {
-            process_frames(ws);
-        }
     } else if (ws->state == WS_STATE_CONNECTED) {
-        // Also process any buffered frames even if no new socket events (non-SSL)
-        // This ensures we don't miss frames that arrived between poll calls
+        // For non-SSL, process frames even if no new socket events
         process_frames(ws);
     }
     
@@ -1262,6 +1436,15 @@ uint64_t websocket_get_last_nic_timestamp_ticks(WebSocket* ws) {
 
 // PHASE 2: Observability - Metrics API implementations
 
+// Comparison function for qsort
+static int compare_uint64_for_sort(const void* a, const void* b) {
+    uint64_t va = *(const uint64_t*)a;
+    uint64_t vb = *(const uint64_t*)b;
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+    return 0;
+}
+
 // Helper function to calculate percentiles from latency samples
 static void calculate_latency_percentiles(WebSocket* ws, double* p50, double* p99) {
     if (!ws || !ws->latency_samples || ws->latency_sample_count == 0) {
@@ -1282,16 +1465,9 @@ static void calculate_latency_percentiles(WebSocket* ws, double* p50, double* p9
     // Copy and sort
     memcpy(sorted, ws->latency_samples, count * sizeof(uint64_t));
     
-    // Simple bubble sort (okay for small arrays, latency_sample_count is typically < 1000)
-    for (size_t i = 0; i < count - 1; i++) {
-        for (size_t j = 0; j < count - i - 1; j++) {
-            if (sorted[j] > sorted[j + 1]) {
-                uint64_t temp = sorted[j];
-                sorted[j] = sorted[j + 1];
-                sorted[j + 1] = temp;
-            }
-        }
-    }
+    // Use qsort for O(n log n) instead of O(n^2) bubble sort
+    // Critical for HFT: latency_sample_count can be up to 1000
+    qsort(sorted, count, sizeof(uint64_t), compare_uint64_for_sort);
     
     // Calculate percentiles
     size_t p50_idx = (size_t)(count * 0.50);
@@ -1330,6 +1506,27 @@ void websocket_set_on_metrics(WebSocket* ws, ws_on_metrics_t callback, void* use
     if (ws) {
         ws->on_metrics = callback;
         ws->metrics_user_data = user_data;
+    }
+}
+
+// Diagnostic tracking (for throughput investigation)
+void websocket_get_diagnostics(WebSocket* ws, uint64_t* ssl_bytes_read, uint64_t* ssl_read_calls,
+                                uint64_t* frames_parsed, uint64_t* frames_processed) {
+    if (!ws) {
+        return;
+    }
+    
+    if (ssl_bytes_read) {
+        *ssl_bytes_read = ws->ssl_bytes_read_total;
+    }
+    if (ssl_read_calls) {
+        *ssl_read_calls = ws->ssl_read_calls;
+    }
+    if (frames_parsed) {
+        *frames_parsed = ws->frames_parsed_total;
+    }
+    if (frames_processed) {
+        *frames_processed = ws->frames_processed_total;
     }
 }
 
@@ -1527,26 +1724,6 @@ static uint32_t calculate_backoff(WebSocket* ws) {
 }
 
 // PHASE 3: Helper to trigger reconnection (called from error handler)
-static void trigger_reconnect(WebSocket* ws) {
-    if (!ws || !ws->reconnect_config.auto_reconnect) {
-        return;
-    }
-    
-    // Check if max retries exceeded
-    if (ws->reconnect_config.max_retries > 0 && 
-        ws->reconnect_state.reconnect_attempts >= ws->reconnect_config.max_retries) {
-        WS_LOG(ws, WS_LOG_WARN, "Max reconnection attempts (%u) exceeded", ws->reconnect_config.max_retries);
-        return;
-    }
-    
-    ws->reconnect_state.is_reconnecting = true;
-    ws->reconnect_state.reconnect_attempts++;
-    ws->reconnect_state.next_backoff_ms = calculate_backoff(ws);
-    ws->last_reconnect_attempt_ns = get_time_ns();
-    
-    WS_LOG(ws, WS_LOG_INFO, "Reconnecting (attempt %u, backoff %u ms)", 
-           ws->reconnect_state.reconnect_attempts, ws->reconnect_state.next_backoff_ms);
-}
 
 // PHASE 3: Error Recovery - Heartbeat API
 
@@ -1573,9 +1750,27 @@ static void check_heartbeat(WebSocket* ws) {
     // Send ping if interval has elapsed
     if (ws->last_ping_sent_ns == 0 || (now_ns - ws->last_ping_sent_ns) >= ping_interval_ns) {
         // Send empty ping frame (RFC 6455 allows empty ping)
-        uint8_t ping_frame[2] = {0x89, 0x00};  // PING opcode, empty payload
-        size_t written = ringbuffer_write(&ws->tx_ring, ping_frame, 2);
-        if (written == 2) {
+        // CRITICAL: Client-to-server frames MUST be masked (RFC 6455 section 5.3)
+        uint32_t masking_key;
+        FILE* urandom = fopen("/dev/urandom", "r");
+        if (urandom) {
+            fread(&masking_key, 1, sizeof(masking_key), urandom);
+            fclose(urandom);
+        } else {
+            masking_key = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+        }
+        
+        // Build masked ping frame: FIN + PING opcode, MASK bit set, empty payload
+        uint8_t ping_frame[6] = {
+            0x89,  // FIN + PING opcode
+            0x80,  // MASK bit set (required for client-to-server)
+            ((uint8_t*)&masking_key)[0],
+            ((uint8_t*)&masking_key)[1],
+            ((uint8_t*)&masking_key)[2],
+            ((uint8_t*)&masking_key)[3]
+        };
+        size_t written = ringbuffer_write(&ws->tx_ring, ping_frame, 6);
+        if (written == 6) {
             if (ws->use_ssl) {
                 ssl_write(ws->ssl_ctx, &ws->tx_ring);
             } else {

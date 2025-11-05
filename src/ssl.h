@@ -52,5 +52,12 @@ uint64_t ssl_get_last_nic_timestamp_ticks(SSLContext* ctx);
 // Returns true if handshake is finished, false otherwise
 bool ssl_is_handshake_complete(SSLContext* ctx);
 
+// Set user data for diagnostic tracking
+void ssl_set_user_data(SSLContext* ctx, void* user_data);
+
+// Get diagnostic counters
+uint64_t ssl_get_bytes_read(SSLContext* ctx);
+uint64_t ssl_get_read_calls(SSLContext* ctx);
+
 #endif // SSL_H
 

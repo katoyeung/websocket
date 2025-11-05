@@ -167,6 +167,12 @@ add_executable(test_integration_stress tests/test_integration_stress.c)
 target_link_libraries(test_integration_stress websocket_hft)
 target_link_libraries(test_integration_stress m)
 
+# WebSocket benchmark test (comparable with libwebsockets benchmark)
+add_executable(test_websocket_benchmark tests/test_websocket_benchmark.c)
+target_link_libraries(test_websocket_benchmark websocket_hft)
+target_link_libraries(test_websocket_benchmark m)
+target_link_libraries(test_websocket_benchmark pthread)
+
 # Example executable
 add_executable(binance_ticker examples/binance_ticker.c)
 target_link_libraries(binance_ticker websocket_hft)

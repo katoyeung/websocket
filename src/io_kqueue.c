@@ -94,9 +94,11 @@ int io_add_socket(IOContext* ctx, int fd, RingBuffer* rx_ring, RingBuffer* tx_ri
     ctx->sockets[idx].last_nic_timestamp_ns = 0;
     ctx->sockets[idx].last_nic_timestamp_ticks = 0;
     
-    // Add socket to kqueue with edge-triggered flags
+    // Add socket to kqueue with level-triggered flags (not edge-triggered)
+    // EV_ONESHOT only fires once per event - we need continuous events for high throughput
+    // Use EV_ADD | EV_CLEAR | EV_ENABLE (without EV_ONESHOT) for continuous data flow
     struct kevent ev;
-    EV_SET(&ev, fd, EVFILT_READ, EV_ADD | EV_CLEAR | EV_ENABLE | EV_ONESHOT, 0, 0, (void*)(intptr_t)idx);
+    EV_SET(&ev, fd, EVFILT_READ, EV_ADD | EV_CLEAR | EV_ENABLE, 0, 0, (void*)(intptr_t)idx);
     
     if (kevent(ctx->kq, &ev, 1, NULL, 0, NULL) == -1) {
         ctx->socket_count--;  // Rollback
@@ -135,7 +137,7 @@ int io_remove_socket(IOContext* ctx, int fd) {
         
         // Update kqueue registration for swapped socket
         int swapped_fd = ctx->sockets[idx].fd;
-        EV_SET(&ev, swapped_fd, EVFILT_READ, EV_ADD | EV_CLEAR | EV_ENABLE | EV_ONESHOT, 0, 0, (void*)(intptr_t)idx);
+        EV_SET(&ev, swapped_fd, EVFILT_READ, EV_ADD | EV_CLEAR | EV_ENABLE, 0, 0, (void*)(intptr_t)idx);
         kevent(ctx->kq, &ev, 1, NULL, 0, NULL);
     }
     
@@ -162,16 +164,9 @@ int io_poll(IOContext* ctx, struct kevent* events, int max_events, int timeout_u
     
     int n = kevent(ctx->kq, NULL, 0, events, max_events, &timeout);
     
-    // Re-enable EV_ONESHOT events
-    for (int i = 0; i < n; i++) {
-        int socket_idx = (int)(intptr_t)events[i].udata;
-        if (socket_idx >= 0 && socket_idx < ctx->socket_count) {
-            int fd = ctx->sockets[socket_idx].fd;
-            struct kevent ev;
-            EV_SET(&ev, fd, EVFILT_READ, EV_ADD | EV_CLEAR | EV_ENABLE | EV_ONESHOT, 0, 0, (void*)(intptr_t)socket_idx);
-            kevent(ctx->kq, &ev, 1, NULL, 0, NULL);
-        }
-    }
+    // Re-enable events (no need for EV_ONESHOT - using level-triggered)
+    // Only re-enable if we're using EV_ONESHOT mode (which we're not anymore)
+    // Events will fire automatically when socket is readable (level-triggered)
     
     return n;
 }
