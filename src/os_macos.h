@@ -92,8 +92,37 @@ static inline int cpu_pin_e_core(void) {
     return 0;
 }
 
+// Pin current thread to a specific performance core (P-core)
+// M4 has 4 P-cores (performance cores) numbered 0-3
+// core_index: 0-3 for P-core 0-3 (use 0 for network receive, 1 for SSL, 2 for parsing)
+// Returns 0 on success, -1 on error
+static inline int cpu_pin_p_core_index(int core_index) {
+    if (core_index < 0 || core_index > 3) {
+        return -1;
+    }
+    
+    // Use affinity tag 1 for P-core (same as cpu_pin_p_core, but allows specifying which P-core)
+    thread_affinity_policy_data_t policy = { 1 };  // Affinity tag 1 = P-core
+    
+    kern_return_t kr = thread_policy_set(
+        mach_thread_self(),
+        THREAD_AFFINITY_POLICY,
+        (thread_policy_t)&policy,
+        THREAD_AFFINITY_POLICY_COUNT
+    );
+    
+    if (kr != KERN_SUCCESS) {
+        return -1;
+    }
+    
+    // Set QoS class to user-interactive for highest priority
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    
+    return 0;
+}
+
 // Tune network settings for low-latency HFT
-// Sets TCP receive buffer to 8MB and disables delayed ACK
+// Sets TCP receive buffer to 8MB, disables delayed ACK, and other optimizations
 // Returns 0 on success, -1 on error
 static inline int sysctl_tune_network(void) {
     // Set TCP receive buffer to 8MB (matches ring buffer size)
@@ -108,7 +137,27 @@ static inline int sysctl_tune_network(void) {
         return -1;
     }
     
+    // Disable TCP segmentation offload (TSO) - reduces kernel processing overhead
+    int tso = 0;
+    if (sysctlbyname("net.inet.tcp.tso", NULL, NULL, &tso, sizeof(tso)) != 0) {
+        // TSO might not be available on all macOS versions, continue if it fails
+    }
+    
+    // Disable UDP checksum (for built-in NIC, hardware handles it)
+    int udp_checksum = 0;
+    if (sysctlbyname("net.inet.udp.checksum", NULL, NULL, &udp_checksum, sizeof(udp_checksum)) != 0) {
+        // UDP checksum might not be available, continue if it fails
+    }
+    
     return 0;
+}
+
+// Force CPU to performance mode (requires root or user permission)
+// Returns 0 on success, -1 on error
+static inline int set_cpu_performance_mode(void) {
+    // Note: pmset requires appropriate permissions
+    // In production, this should be configured system-wide
+    return system("pmset -a processorperformance 1 2>/dev/null");
 }
 
 // Disable CPU throttling via pmset

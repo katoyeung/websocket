@@ -53,8 +53,8 @@ struct SSLContext {
     uint64_t ssl_read_calls;
 };
 
-// Helper to convert timespec to nanoseconds
-static uint64_t timespec_to_ns_ssl(const struct timespec* ts) {
+// Helper to convert timespec to nanoseconds (inlined for performance)
+static inline uint64_t timespec_to_ns_ssl(const struct timespec* ts) {
     return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
 }
 
@@ -90,15 +90,15 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
     // This allows SecureTransport to read even when socket appears idle
     ssize_t n = recvmsg(ctx->fd, &msg, 0);
     
-    if (n > 0) {
+    if (__builtin_expect(n > 0, 1)) {  // Hot path: expect success
         // Extract NIC timestamp from control message
         // CRITICAL: Check msg_controllen to see if we got control messages
         bool timestamp_found = false;
         struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
         while (cmsg != NULL) {
-            if (cmsg->cmsg_level == SOL_SOCKET) {
+            if (__builtin_expect(cmsg->cmsg_level == SOL_SOCKET, 1)) {  // Hot path: expect socket level
                 #ifdef SCM_TIMESTAMPNS
-                if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+                if (__builtin_expect(cmsg->cmsg_type == SCM_TIMESTAMPNS, 1)) {  // Hot path: prefer nanosecond precision
                     struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
                     uint64_t nic_ns = timespec_to_ns_ssl(ts);
                     ctx->last_nic_timestamp_ns = nic_ns;
@@ -115,7 +115,7 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
                     uint64_t now_ticks = mach_absolute_time();
                     uint64_t now_ns = (now_ticks * cached_timebase_st.numer) / cached_timebase_st.denom;
                     
-                    if (nic_ns <= now_ns && now_ns > 0 && cached_timebase_st.denom > 0) {
+                    if (__builtin_expect(nic_ns <= now_ns && now_ns > 0 && cached_timebase_st.denom > 0, 1)) {  // Hot path: expect valid timestamp
                         uint64_t diff_ns = now_ns - nic_ns;
                         // Integer-only conversion: diff_ticks = (diff_ns * denom) / numer
                         uint64_t diff_ticks = (diff_ns * cached_timebase_st.denom) / cached_timebase_st.numer;
@@ -144,7 +144,7 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
                     uint64_t now_ticks = mach_absolute_time();
                     uint64_t now_ns = (now_ticks * cached_timebase_st.numer) / cached_timebase_st.denom;
                     
-                    if (nic_ns <= now_ns && now_ns > 0 && cached_timebase_st.denom > 0) {
+                    if (__builtin_expect(nic_ns <= now_ns && now_ns > 0 && cached_timebase_st.denom > 0, 1)) {  // Hot path: expect valid timestamp
                         uint64_t diff_ns = now_ns - nic_ns;
                         // Integer-only conversion: diff_ticks = (diff_ns * denom) / numer
                         uint64_t diff_ticks = (diff_ns * cached_timebase_st.denom) / cached_timebase_st.numer;

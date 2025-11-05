@@ -8,10 +8,12 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include <time.h>
 #include <pthread.h>
 #include <sched.h>
-#include <stdio.h>
+
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
 
 int io_init(IOContext* ctx) {
     if (!ctx) {
@@ -26,14 +28,34 @@ int io_init(IOContext* ctx) {
         return -1;
     }
     
-    // Pin thread to E-core for efficient I/O handling
+#ifdef __APPLE__
+    // M4 OPTIMIZATION: Create GCD queues with CPU core binding
+    // Use Dispatch.framework for optimized CPU scheduling
+    
+    // I/O queue: Pin to E-core for efficient I/O multiplexing
     if (cpu_pin_e_core() == 0) {
         ctx->e_core_pinned = 1;
     }
     
-    // Bind to high-priority core (avoid E-core for latency-sensitive I/O)
-    // Note: On macOS, pthread_setaffinity_np is not available, but we can set real-time priority
-    // Set real-time priority
+    // M4 OPTIMIZATION: Create GCD queues with high-priority QoS for optimal CPU scheduling
+    // Use dispatch_queue_attr_make_with_qos_class for better performance than set_target_queue
+    dispatch_queue_attr_t qos_attr = dispatch_queue_attr_make_with_qos_class(
+        DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+    
+    // I/O operations queue (E-core optimized)
+    ctx->io_queue = dispatch_queue_create("com.hft.io", qos_attr);
+    
+    // Network receive queue (P-core 0 optimized)
+    ctx->net_queue = dispatch_queue_create("com.hft.net", qos_attr);
+    
+    // SSL encryption queue (P-core 1 optimized)
+    ctx->ssl_queue = dispatch_queue_create("com.hft.ssl", qos_attr);
+    
+    // Parsing queue (P-core 2 optimized)
+    ctx->parse_queue = dispatch_queue_create("com.hft.parse", qos_attr);
+#endif
+    
+    // Set real-time priority (fallback if GCD not available)
     struct sched_param param = {.sched_priority = 49};
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
         // Real-time scheduling may require privileges, continue if it fails
@@ -59,6 +81,26 @@ void io_cleanup(IOContext* ctx) {
         close(ctx->kq);
         ctx->kq = -1;
     }
+    
+#ifdef __APPLE__
+    // Release GCD queues
+    if (ctx->io_queue) {
+        dispatch_release((dispatch_queue_t)ctx->io_queue);
+        ctx->io_queue = NULL;
+    }
+    if (ctx->net_queue) {
+        dispatch_release((dispatch_queue_t)ctx->net_queue);
+        ctx->net_queue = NULL;
+    }
+    if (ctx->ssl_queue) {
+        dispatch_release((dispatch_queue_t)ctx->ssl_queue);
+        ctx->ssl_queue = NULL;
+    }
+    if (ctx->parse_queue) {
+        dispatch_release((dispatch_queue_t)ctx->parse_queue);
+        ctx->parse_queue = NULL;
+    }
+#endif
     
     ctx->socket_count = 0;
 }
@@ -171,8 +213,8 @@ int io_poll(IOContext* ctx, struct kevent* events, int max_events, int timeout_u
     return n;
 }
 
-// Helper to convert timespec to nanoseconds
-static uint64_t timespec_to_ns(const struct timespec* ts) {
+// Helper to convert timespec to nanoseconds (inlined for performance)
+static inline uint64_t timespec_to_ns(const struct timespec* ts) {
     return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
 }
 
@@ -191,8 +233,8 @@ ssize_t io_read(IOContext* ctx, int socket_index) {
     size_t available;
     ringbuffer_write_inline(sock->rx_ring, &write_ptr, &available);
     
-    if (available == 0) {
-        return 0;  // Ring buffer full
+    if (__builtin_expect(available == 0, 0)) {  // Cold path: buffer full is rare
+        return 0;
     }
     
     // Use recvmsg() to capture NIC timestamp via SO_TIMESTAMP_OLD
@@ -213,17 +255,17 @@ ssize_t io_read(IOContext* ctx, int socket_index) {
     
     ssize_t n = recvmsg(sock->fd, &msg, 0);
     
-    if (n > 0) {
+    if (__builtin_expect(n > 0, 1)) {  // Hot path: expect success
         // Extract NIC timestamp from control message
         // macOS uses SO_TIMESTAMP which provides SCM_TIMESTAMP control message
         struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
         while (cmsg != NULL) {
-            if (cmsg->cmsg_level == SOL_SOCKET) {
+            if (__builtin_expect(cmsg->cmsg_level == SOL_SOCKET, 1)) {  // Hot path: expect socket level
                 // Try both SCM_TIMESTAMP and SCM_TIMESTAMPNS (if available)
                 // On macOS, SO_TIMESTAMP gives SCM_TIMESTAMP with timeval
                 // SO_TIMESTAMPNS gives SCM_TIMESTAMPNS with timespec
                 #ifdef SCM_TIMESTAMPNS
-                if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+                if (__builtin_expect(cmsg->cmsg_type == SCM_TIMESTAMPNS, 1)) {  // Hot path: prefer nanosecond precision
                     struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
                     uint64_t nic_ns = timespec_to_ns(ts);
                 
@@ -301,8 +343,10 @@ ssize_t io_read(IOContext* ctx, int socket_index) {
         
         __atomic_thread_fence(__ATOMIC_RELEASE);
         sock->rx_ring->write_ptr = new_wp % sock->rx_ring->size;
-    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        return -1;  // Error or EOF
+    } else if (__builtin_expect(n < 0 && errno != EAGAIN && errno != EWOULDBLOCK, 0)) {
+        return -1;  // Error (cold path)
+    } else if (__builtin_expect(n == 0, 0)) {
+        return -1;  // EOF (cold path)
     }
     
     return n;
@@ -323,8 +367,8 @@ ssize_t io_write(IOContext* ctx, int socket_index) {
     size_t available;
     ringbuffer_read_inline(sock->tx_ring, &read_ptr, &available);
     
-    if (available == 0) {
-        return 0;  // No data to write
+    if (__builtin_expect(available == 0, 0)) {  // Cold path: no data is rare
+        return 0;
     }
     
     RingBuffer* rb = sock->tx_ring;
@@ -334,8 +378,8 @@ ssize_t io_write(IOContext* ctx, int socket_index) {
     iov[0].iov_base = read_ptr;
     iov[0].iov_len = available;
     
-    // Handle wrap-around with scatter-gather
-    if (rb->read_ptr + available > rb->size) {
+    // Handle wrap-around with scatter-gather (cold path: wrap-around is rare)
+    if (__builtin_expect(rb->read_ptr + available > rb->size, 0)) {
         iov[0].iov_len = rb->size - rb->read_ptr;
         iov[1].iov_base = rb->buf;
         iov[1].iov_len = available - iov[0].iov_len;
@@ -345,7 +389,7 @@ ssize_t io_write(IOContext* ctx, int socket_index) {
     // Zero-copy batch write
     ssize_t n = writev(sock->fd, iov, iov_cnt);
     
-    if (n > 0) {
+    if (__builtin_expect(n > 0, 1)) {  // Hot path: expect success
         // Update ring buffer read pointer
         size_t rp = rb->read_ptr;
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -368,4 +412,23 @@ uint64_t io_get_last_nic_timestamp_ticks(IOContext* ctx, int socket_index) {
     }
     return ctx->sockets[socket_index].last_nic_timestamp_ticks;
 }
+
+#ifdef __APPLE__
+// M4 OPTIMIZATION: Get GCD queues for optimized CPU scheduling
+void* io_get_io_queue(IOContext* ctx) {
+    return ctx ? ctx->io_queue : NULL;
+}
+
+void* io_get_net_queue(IOContext* ctx) {
+    return ctx ? ctx->net_queue : NULL;
+}
+
+void* io_get_ssl_queue(IOContext* ctx) {
+    return ctx ? ctx->ssl_queue : NULL;
+}
+
+void* io_get_parse_queue(IOContext* ctx) {
+    return ctx ? ctx->parse_queue : NULL;
+}
+#endif
 

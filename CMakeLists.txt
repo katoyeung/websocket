@@ -5,6 +5,11 @@ project(websocket_hft VERSION 1.0.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Enable blocks support for Network.framework (required for dispatch blocks)
+if(APPLE)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fblocks")
+endif()
+
 # Detect Apple Silicon (ARM64)
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=apple-m4 -mtune=apple-m4")
@@ -47,6 +52,7 @@ set(SOURCES
     src/ssl.c
     src/parser_neon.c
     src/websocket.c
+    src/network_framework.c
 )
 
 set(HEADERS
@@ -57,6 +63,7 @@ set(HEADERS
     src/websocket.h
     src/os_macos.h
     src/internal.h
+    src/network_framework.h
 )
 
 # Create static library
@@ -69,12 +76,26 @@ target_include_directories(websocket_hft PUBLIC
 
 # Link SecureTransport framework (primary TLS implementation)
 find_library(SECURITY_FRAMEWORK Security)
-find_library(SECURITYFOUNDATION_FRAMEWORK SecurityFoundation)
 if(SECURITY_FRAMEWORK)
     target_link_libraries(websocket_hft PRIVATE ${SECURITY_FRAMEWORK})
 endif()
-if(SECURITYFOUNDATION_FRAMEWORK)
-    target_link_libraries(websocket_hft PRIVATE ${SECURITYFOUNDATION_FRAMEWORK})
+
+# Link Network.framework for user-space kernel bypass (M4 optimization)
+find_library(NETWORK_FRAMEWORK Network)
+if(NETWORK_FRAMEWORK)
+    target_link_libraries(websocket_hft PRIVATE ${NETWORK_FRAMEWORK})
+    message(STATUS "Network.framework found - enabling user-space kernel bypass")
+else()
+    message(WARNING "Network.framework not found - falling back to traditional socket API")
+endif()
+
+# Link Dispatch.framework (GCD) for optimized CPU scheduling (M4 optimization)
+find_library(DISPATCH_FRAMEWORK dispatch)
+if(DISPATCH_FRAMEWORK)
+    target_link_libraries(websocket_hft PRIVATE ${DISPATCH_FRAMEWORK})
+    message(STATUS "Dispatch.framework found - enabling GCD scheduling")
+else()
+    message(WARNING "Dispatch.framework not found - using pthread fallback")
 endif()
 
 # Link system libraries

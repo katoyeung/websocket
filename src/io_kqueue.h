@@ -24,6 +24,14 @@ typedef struct {
     IOSocket sockets[IO_MAX_SOCKETS]; // Socket registry
     int socket_count;                 // Active socket count
     int e_core_pinned;                 // Whether thread is pinned to E-core
+    
+#ifdef __APPLE__
+    // GCD queues for optimized CPU scheduling (M4 optimization)
+    void* io_queue;                    // Dispatch queue for I/O operations (E-core)
+    void* net_queue;                   // Dispatch queue for network receive (P-core 0)
+    void* ssl_queue;                   // Dispatch queue for SSL encryption (P-core 1)
+    void* parse_queue;                 // Dispatch queue for parsing (P-core 2)
+#endif
 } IOContext;
 
 // Initialize kqueue I/O context
@@ -63,6 +71,15 @@ uint64_t io_get_last_nic_timestamp_ns(IOContext* ctx, int socket_index);
 
 // Get last captured NIC timestamp in CPU cycles
 uint64_t io_get_last_nic_timestamp_ticks(IOContext* ctx, int socket_index);
+
+#ifdef __APPLE__
+// M4 OPTIMIZATION: Get GCD queues for optimized CPU scheduling
+// Returns GCD queue pointer (dispatch_queue_t) or NULL if not available
+void* io_get_io_queue(IOContext* ctx);      // I/O operations queue (E-core)
+void* io_get_net_queue(IOContext* ctx);      // Network receive queue (P-core 0)
+void* io_get_ssl_queue(IOContext* ctx);     // SSL encryption queue (P-core 1)
+void* io_get_parse_queue(IOContext* ctx);    // Parsing queue (P-core 2)
+#endif
 
 #endif // IO_KQUEUE_H
 
