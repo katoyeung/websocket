@@ -16,6 +16,26 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
     message(STATUS "Detected Apple Silicon - enabling M4 optimizations")
 endif()
 
+# Ring buffer size option (default 1MB for lower memory, can be set to 8MB for HFT)
+# Use set() with CACHE STRING to allow numeric override, default to 1MB
+set(WEBSOCKET_RING_BUFFER_SIZE_MB "1" CACHE STRING "Ring buffer size in MB (default: 1, use 8 for HFT)")
+
+# Parse the value - handle both string and numeric, default to 1MB
+set(RING_BUFFER_SIZE_MB 1)  # Default value
+
+# Check if it's a valid number (not ON/OFF boolean)
+if(WEBSOCKET_RING_BUFFER_SIZE_MB)
+    if(WEBSOCKET_RING_BUFFER_SIZE_MB MATCHES "^[0-9]+$")
+        # Valid numeric value
+        set(RING_BUFFER_SIZE_MB ${WEBSOCKET_RING_BUFFER_SIZE_MB})
+    endif()
+endif()
+
+# Calculate bytes and set compile definition
+math(EXPR RING_BUFFER_SIZE_BYTES "${RING_BUFFER_SIZE_MB} * 1024 * 1024")
+add_compile_definitions(RINGBUFFER_SIZE=${RING_BUFFER_SIZE_BYTES})
+message(STATUS "WebSocket ring buffer size: ${RING_BUFFER_SIZE_MB}MB (${RING_BUFFER_SIZE_BYTES} bytes)")
+
 # Optimize for HFT (low latency, no dynamic allocations in hot path)
 set(CMAKE_C_FLAGS_RELEASE "-O3 -ffast-math -fno-pie")
 set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address")
@@ -81,15 +101,19 @@ if(SECURITY_FRAMEWORK)
 endif()
 
 # Link Network.framework for user-space kernel bypass (M4 optimization)
+# REQUIRED: network_framework.c is compiled and uses Network.framework APIs
+# Even though websocket.c doesn't use it directly, network_framework.c is part of the build
 find_library(NETWORK_FRAMEWORK Network)
 if(NETWORK_FRAMEWORK)
     target_link_libraries(websocket_hft PRIVATE ${NETWORK_FRAMEWORK})
     message(STATUS "Network.framework found - enabling user-space kernel bypass")
 else()
-    message(WARNING "Network.framework not found - falling back to traditional socket API")
+    message(WARNING "Network.framework not found - network_framework.c will use fallback")
 endif()
 
 # Link Dispatch.framework (GCD) for optimized CPU scheduling (M4 optimization)
+# Used in io_kqueue.c for dispatch queues (I/O operations)
+# Also used in network_framework.c for Network.framework queues
 find_library(DISPATCH_FRAMEWORK dispatch)
 if(DISPATCH_FRAMEWORK)
     target_link_libraries(websocket_hft PRIVATE ${DISPATCH_FRAMEWORK})

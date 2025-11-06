@@ -947,34 +947,71 @@ int websocket_send(WebSocket* ws, const uint8_t* data, size_t len, bool is_text)
         return -1;
     }
     
-    // Build WebSocket frame
+    // CRITICAL: RFC 6455 requires client-to-server frames to be MASKED
+    // Generate random masking key (required for client-to-server frames)
+    uint32_t masking_key;
+    FILE* urandom = fopen("/dev/urandom", "r");
+    if (urandom) {
+        fread(&masking_key, 1, sizeof(masking_key), urandom);
+        fclose(urandom);
+    } else {
+        // Fallback (less secure but better than nothing)
+        masking_key = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+    }
+    
+    // Mask the payload
+    uint8_t* masked_payload = (uint8_t*)malloc(len);
+    if (!masked_payload) {
+        return -1;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        masked_payload[i] = data[i] ^ ((uint8_t*)&masking_key)[i % 4];
+    }
+    
+    // Build WebSocket frame with masking
     uint8_t frame_header[14];
     size_t header_size = 2;
     
     frame_header[0] = 0x80 | (is_text ? WS_OPCODE_TEXT : WS_OPCODE_BINARY);
-    frame_header[1] = 0;  // No mask (client-to-server)
+    frame_header[1] = 0x80;  // MASK bit set (required for client-to-server)
     
     if (len < 126) {
         frame_header[1] |= len;
+        frame_header[2] = ((uint8_t*)&masking_key)[0];
+        frame_header[3] = ((uint8_t*)&masking_key)[1];
+        frame_header[4] = ((uint8_t*)&masking_key)[2];
+        frame_header[5] = ((uint8_t*)&masking_key)[3];
+        header_size = 6;
     } else if (len < 65536) {
         frame_header[1] |= 126;
         uint16_t len16 = htons((uint16_t)len);
         memcpy(frame_header + 2, &len16, 2);
-        header_size = 4;
+        frame_header[4] = ((uint8_t*)&masking_key)[0];
+        frame_header[5] = ((uint8_t*)&masking_key)[1];
+        frame_header[6] = ((uint8_t*)&masking_key)[2];
+        frame_header[7] = ((uint8_t*)&masking_key)[3];
+        header_size = 8;
     } else {
         frame_header[1] |= 127;
         uint64_t len64 = __builtin_bswap64(len);
         memcpy(frame_header + 2, &len64, 8);
-        header_size = 10;
+        frame_header[10] = ((uint8_t*)&masking_key)[0];
+        frame_header[11] = ((uint8_t*)&masking_key)[1];
+        frame_header[12] = ((uint8_t*)&masking_key)[2];
+        frame_header[13] = ((uint8_t*)&masking_key)[3];
+        header_size = 14;
     }
     
-    // Write frame to tx_ring
+    // Write frame header to tx_ring
     size_t written = ringbuffer_write(&ws->tx_ring, frame_header, header_size);
     if (written != header_size) {
+        free(masked_payload);
         return -1;
     }
     
-    written = ringbuffer_write(&ws->tx_ring, data, len);
+    // Write masked payload to tx_ring
+    written = ringbuffer_write(&ws->tx_ring, masked_payload, len);
+    free(masked_payload);
     if (written != len) {
         return -1;
     }

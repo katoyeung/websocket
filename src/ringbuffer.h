@@ -4,7 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RINGBUFFER_SIZE (8 * 1024 * 1024)  // 8MB
+#ifndef RINGBUFFER_SIZE
+#define RINGBUFFER_SIZE (8 * 1024 * 1024)  // 8MB default (can be overridden via CMake)
+#endif
 #define RINGBUFFER_ALIGNMENT 128           // M4 cache line size
 
 typedef struct {
