@@ -82,8 +82,7 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
     msg.msg_controllen = sizeof(control);
     msg.msg_flags = 0;
     
-    // CRITICAL FIX: Capture timestamp RIGHT BEFORE recvmsg() call
-    // This is the closest we can get to packet arrival time when using SecureTransport
+    // Capture timestamp right before recvmsg() call
     uint64_t packet_arrival_ticks = mach_absolute_time();
     
     // Use non-blocking reads - socket is already non-blocking from tcp_connect
@@ -159,9 +158,7 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
             cmsg = CMSG_NXTHDR(&msg, cmsg);
         }
         
-        // CRITICAL FIX: If no timestamp found from control messages, use packet_arrival_ticks
-        // This happens when SecureTransport doesn't preserve SO_TIMESTAMPNS control messages
-        // Using timestamp right before recvmsg() is the best approximation we can get
+        // If no timestamp found from control messages, use packet_arrival_ticks
         if (!timestamp_found) {
             ctx->last_nic_timestamp_ticks = packet_arrival_ticks;
             
@@ -240,34 +237,44 @@ int ssl_init(SSLContext** out_ctx, bool disable_cert_validation) {
         return -1;
     }
     
-    // Try SecureTransport first
-    OSStatus status = SSLNewContext(false, &ctx->st_ctx);
-    if (status == noErr && ctx->st_ctx) {
-        // Set I/O functions
-        status = SSLSetIOFuncs(ctx->st_ctx, ssl_read_func, ssl_write_func);
+    // Default to OpenSSL (works for both fast and slow connections)
+    // SecureTransport can be forced via FORCE_SECURETRANSPORT=1 if needed
+    const char* force_securetransport = getenv("FORCE_SECURETRANSPORT");
+    bool use_securetransport = (force_securetransport && 
+                                (force_securetransport[0] == '1' || 
+                                 force_securetransport[0] == 'y' || 
+                                 force_securetransport[0] == 'Y'));
+    
+    const char* force_openssl = getenv("FORCE_OPENSSL");
+    bool use_openssl = (force_openssl && 
+                       (force_openssl[0] == '1' || 
+                        force_openssl[0] == 'y' || 
+                        force_openssl[0] == 'Y'));
+    
+    // Only use SecureTransport if explicitly forced
+    if (use_securetransport && !use_openssl) {
+        OSStatus status = SSLNewContext(false, &ctx->st_ctx);
+        if (status == noErr && ctx->st_ctx) {
+            // Set I/O functions
+            status = SSLSetIOFuncs(ctx->st_ctx, ssl_read_func, ssl_write_func);
         if (status == noErr) {
-            // CRITICAL: Optimize SecureTransport for maximum throughput
             // Disable certificate validation if requested (HFT optimization)
             if (disable_cert_validation) {
                 SSLSetSessionOption(ctx->st_ctx, kSSLSessionOptionBreakOnServerAuth, false);
             }
             
-            // OPTIMIZATION: Set protocol versions for best performance
-            // TLS 1.2+ is required by Binance, but we can optimize protocol negotiation
+            // Set protocol versions (TLS 1.2+ required by Binance)
             SSLProtocol protocol = kTLSProtocol12;
             SSLSetProtocolVersionMin(ctx->st_ctx, protocol);
             SSLSetProtocolVersionMax(ctx->st_ctx, kTLSProtocol13);
-            
-            // OPTIMIZATION: Disable session resumption to reduce handshake overhead
-            // This can improve initial connection speed
-            // Note: This may slightly increase handshake time but reduces memory usage
             
             *out_ctx = ctx;
             return 0;
         }
     }
+    }
     
-    // SecureTransport failed, try OpenSSL fallback
+    // Use OpenSSL by default
 #if defined(HAVE_OPENSSL)
     // Initialize OpenSSL library (thread-safe, can be called multiple times)
     static bool openssl_global_inited = false;
@@ -302,8 +309,7 @@ int ssl_init(SSLContext** out_ctx, bool disable_cert_validation) {
     SSL_CTX_set_mode(ctx->ossl_ctx, SSL_MODE_RELEASE_BUFFERS);
     SSL_CTX_set_options(ctx->ossl_ctx, SSL_OP_NO_TICKET);
     
-    // PHASE 1 FIX: Disable session caching from initialization
-    // Prevent OpenSSL from caching TLS sessions to reduce memory growth
+    // Disable session caching to reduce memory growth
     SSL_CTX_set_session_cache_mode(ctx->ossl_ctx, SSL_SESS_CACHE_OFF);
     
     ctx->backend = SSL_BACKEND_OPENSSL;
@@ -322,7 +328,7 @@ void ssl_cleanup(SSLContext* ctx) {
         return;
     }
     
-    // CRITICAL: Close socket first to ensure clean SSL shutdown
+    // Close socket first to ensure clean SSL shutdown
     if (ctx->fd >= 0) {
         shutdown(ctx->fd, SHUT_RDWR);
         close(ctx->fd);
@@ -330,18 +336,10 @@ void ssl_cleanup(SSLContext* ctx) {
     }
     
     if (ctx->backend == SSL_BACKEND_SECURETRANSPORT && ctx->st_ctx) {
-        // PRIORITY 1 FIX: Force SSL close before disposal to ensure clean shutdown
-        // SSLClose() properly terminates the SSL connection and releases resources
-        // This helps reduce memory growth during rapid connect/disconnect cycles
-        // Note: SecureTransport doesn't provide a direct API to disable session caching,
-        // but proper cleanup with SSLClose() before disposal helps minimize resource retention
-        // CRITICAL FIX: Only call SSLClose once on the context (not on st_conn)
+        // Force SSL close before disposal to ensure clean shutdown
+        // Only call SSLClose once on the context (not on st_conn)
         OSStatus close_status = SSLClose(ctx->st_ctx);
         (void)close_status;  // Ignore errors during cleanup
-        
-        // Small delay to allow SecureTransport to release resources
-        // This helps ensure cleanup is complete before disposal
-        usleep(1000);  // 1ms delay
         
         // Dispose context (this releases all SSL state including connection)
         SSLDisposeContext(ctx->st_ctx);
@@ -358,8 +356,7 @@ void ssl_cleanup(SSLContext* ctx) {
             ctx->ossl_ssl = NULL;
         }
         if (ctx->ossl_ctx) {
-            // PRIORITY 1 FIX: Session cache is already disabled at initialization
-            // SSL_CTX_flush_sessions can cause crashes in some OpenSSL versions
+            // Session cache is already disabled at initialization
             // Freeing the context will clean up sessions automatically
             SSL_CTX_free(ctx->ossl_ctx);
             ctx->ossl_ctx = NULL;
@@ -367,8 +364,7 @@ void ssl_cleanup(SSLContext* ctx) {
     }
 #endif
     
-    // PRIORITY 1 FIX: Regular free (VM_DEALLOCATE was causing crashes)
-    // The SSL session cache flushing and explicit cleanup should be sufficient
+    // Free read buffer
     if (ctx->read_buf) {
         free(ctx->read_buf);
         ctx->read_buf = NULL;
@@ -495,13 +491,13 @@ ssize_t ssl_read(SSLContext* ctx, RingBuffer* rb) {
     size_t requested = available;
     size_t actual = requested;
     
-    // CRITICAL FIX: Count ALL SSL read attempts, not just successful ones
-    // This gives accurate diagnostics on how frequently we're calling SSLRead
+    // Count all SSL read attempts for diagnostics
     ctx->ssl_read_calls++;
     
     OSStatus status = SSLRead(ctx->st_ctx, write_ptr, requested, &actual);
     
     if (status == noErr && actual > 0) {
+        
         // Update ring buffer write pointer
         size_t wp = rb->write_ptr;
         __sync_synchronize();

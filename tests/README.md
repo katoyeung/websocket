@@ -310,5 +310,3 @@ When adding new features:
 - API Documentation: `../README.md#api-reference`
 - Performance Targets: `../README.md#performance-targets`
 
-
-

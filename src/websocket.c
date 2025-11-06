@@ -139,6 +139,9 @@ struct WebSocket {
     WSHeartbeatConfig heartbeat_config;
     uint64_t last_ping_sent_ns;
     uint64_t last_pong_received_ns;
+    
+    // SSL polling optimization - track when we last got data for adaptive polling
+    uint64_t last_ssl_data_time_ns;
 };
 
 // Generate WebSocket key for handshake
@@ -605,14 +608,14 @@ static void process_frames(WebSocket* ws) {
             
             // Send pong frame with same payload (RFC 6455 requirement)
             // Pong frames must be masked from client to server
-            if (websocket_send_pong(ws, ping_payload, ping_len) != 0) {
+            int pong_result = websocket_send_pong(ws, ping_payload, ping_len);
+            if (pong_result != 0) {
                 // Failed to send pong - this may cause disconnection
-                // But don't fail the entire connection, just log it
+                WS_LOG(ws, WS_LOG_ERROR, "Failed to send PONG frame in response to PING (error=%d)", pong_result);
             }
         } else if (frame->opcode == WS_OPCODE_PONG) {
             // PHASE 3: Record pong receipt for heartbeat monitoring
             ws->last_pong_received_ns = get_time_ns();
-            WS_LOG(ws, WS_LOG_DEBUG, "Received heartbeat pong");
             // Pong response received - no action needed, just acknowledge
             // Binance documentation says unsolicited pongs are allowed
         } else if (frame->opcode == WS_OPCODE_CLOSE) {
@@ -1063,6 +1066,7 @@ int websocket_process(WebSocket* ws) {
     int event_count = io_poll(ws->io_ctx, events, IO_MAX_SOCKETS, timeout_us);
     
     if (event_count < 0) {
+        WS_LOG(ws, WS_LOG_ERROR, "websocket_process: io_poll() returned error: %d", event_count);
         return -1;
     }
     
@@ -1072,6 +1076,7 @@ int websocket_process(WebSocket* ws) {
         // Check for connection closure (EOF or error)
         if (events[i].flags & EV_EOF || events[i].flags & EV_ERROR) {
             // Connection closed or error
+            WS_LOG(ws, WS_LOG_WARN, "websocket_process: Connection closed/error: flags=0x%x", events[i].flags);
             if (ws->state == WS_STATE_CONNECTED || ws->state == WS_STATE_CONNECTING) {
                 ws->state = WS_STATE_CLOSED;
                 // Connection closed - callback will handle reconnect if needed
@@ -1187,6 +1192,7 @@ int websocket_process(WebSocket* ws) {
                         break;
                     } else {
                         // Error - stop draining
+                        WS_LOG(ws, WS_LOG_ERROR, "websocket_process: SSL read error: %zd", ssl_result);
                         break;
                     }
                 }
@@ -1300,6 +1306,21 @@ int websocket_process(WebSocket* ws) {
                             ws->reconnect_state.is_reconnecting = false;
                             ws->reconnect_state.next_backoff_ms = ws->reconnect_config.initial_backoff_ms;
                         }
+                        
+                        // CRITICAL FIX: Re-register socket with kqueue after connection is established
+                        // This ensures kqueue properly detects readable events after SSL handshake completes
+                        // SecureTransport may change socket state during handshake, so re-registration ensures
+                        // kqueue is properly monitoring the socket for new data
+                        if (ws->socket_index >= 0 && ws->io_ctx) {
+                            struct kevent ev;
+                            EV_SET(&ev, ws->fd, EVFILT_READ, EV_ADD | EV_CLEAR | EV_ENABLE, 0, 0, (void*)(intptr_t)ws->socket_index);
+                            if (kevent(ws->io_ctx->kq, &ev, 1, NULL, 0, NULL) == 0) {
+                                WS_LOG(ws, WS_LOG_INFO, "Re-registered socket with kqueue after connection");
+                            } else {
+                                WS_LOG(ws, WS_LOG_WARN, "Failed to re-register socket with kqueue: %s", strerror(errno));
+                            }
+                        }
+                        
                         // Re-register write event if tx_ring has data
                         if (ringbuffer_readable(&ws->tx_ring) > 0) {
                             struct kevent ev;
@@ -1342,28 +1363,171 @@ int websocket_process(WebSocket* ws) {
     
     // CRITICAL: For SSL connections, use hybrid approach
     // 1. Ultra-aggressive draining when kqueue reports readable (EVFILT_READ handler)
-    // 2. Occasional reads between events to catch SecureTransport's buffered data
-    // SecureTransport buffers data internally, so we need to read periodically
+    // 2. CONTINUOUS polling between events to catch SecureTransport's buffered data
+    // 3. FALLBACK: Use select() to check socket directly when kqueue fails
+    // SecureTransport buffers data internally, and kqueue may not detect it immediately
+    // SOLUTION: Poll SSL reads continuously with adaptive frequency + select() fallback
     if (ws->state == WS_STATE_CONNECTED && ws->use_ssl) {
-        // CRITICAL: Always read SSL aggressively when no kqueue events - catch SecureTransport buffered data
-        // With 0 timeout kqueue, we can call very frequently
-        // When kqueue reports readable, we drain 50k+ times in EVFILT_READ handler
-        // Between events, we need to read MANY times to catch all buffered data
+        // CRITICAL FIX: For SSL connections, use select() as PRIMARY mechanism, not just fallback
+        // kqueue is unreliable for slow connections (like Binance ~1 msg/sec)
+        // Okx/Bitget work because they send messages frequently, keeping socket 'active'
+        // Binance fails because kqueue misses events when socket appears 'idle'
+        // SOLUTION: Check select() EVERY TIME for SSL connections, regardless of kqueue events
+        // This ensures we catch data immediately, even for slow connections
+        if (ws->fd >= 0) {
+            fd_set read_fds;
+            struct timeval timeout;
+            FD_ZERO(&read_fds);
+            FD_SET(ws->fd, &read_fds);
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 0;  // Non-blocking check
+            
+            int select_result = select(ws->fd + 1, &read_fds, NULL, NULL, &timeout);
+            if (select_result > 0 && FD_ISSET(ws->fd, &read_fds)) {
+                // Socket is readable but kqueue didn't detect it - force SSL read
+                // Process frames first to free buffer space
+                process_frames(ws);
+                
+                // Force SSL read when select() detects readable
+                // CRITICAL: Read aggressively in a tight loop until we get data or socket is empty
+                // This is key for slow connections (like Binance) where kqueue misses events
+                int select_read_attempts = 0;
+                const int max_select_reads = 1000;  // Read up to 1000 times when select() detects data
+                bool got_data_via_select = false;
+                int consecutive_would_block_select = 0;
+                const int max_would_block_select = 50;  // Stop after 50 consecutive would-blocks
+                
+                while (select_read_attempts < max_select_reads && ws->state == WS_STATE_CONNECTED) {
+                    select_read_attempts++;
+                    ssize_t ssl_result = ssl_read(ws->ssl_ctx, &ws->rx_ring);
+                    
+                    // CRITICAL FIX: If select() says readable but SSLRead() returns would-block,
+                    // SecureTransport might be processing encrypted data in the background.
+                    // Add a tiny delay to give it time to decrypt before trying again.
+                    // This is especially important for slow connections like Binance.
+                    if (ssl_result == 0 && select_read_attempts > 1) {
+                        // Give SecureTransport a moment to process encrypted data
+                        // Use usleep for very short delay (microseconds)
+                        usleep(10);  // 10 microseconds - very short, just enough to let SecureTransport process
+                    }
+                    
+                    if (ssl_result > 0) {
+                        got_data_via_select = true;
+                        consecutive_would_block_select = 0;  // Reset counter
+                        // Update timestamp for adaptive polling
+                        ws->last_ssl_data_time_ns = get_time_ns();
+                        
+                        // Process frames immediately
+                        process_frames(ws);
+                        
+                        // Drain frames aggressively
+                        int frame_iter = 0;
+                        while (frame_iter < 500 && ws->state == WS_STATE_CONNECTED) {
+                            size_t before = ws->rx_ring.read_ptr;
+                            process_frames(ws);
+                            size_t after = ws->rx_ring.read_ptr;
+                            if (after == before) break;
+                            frame_iter++;
+                        }
+                        
+                        // Check select() again - there might be more data
+                        FD_ZERO(&read_fds);
+                        FD_SET(ws->fd, &read_fds);
+                        timeout.tv_sec = 0;
+                        timeout.tv_usec = 0;
+                        if (select(ws->fd + 1, &read_fds, NULL, NULL, &timeout) > 0 && FD_ISSET(ws->fd, &read_fds)) {
+                            // More data available - continue reading
+                            continue;
+                        }
+                        // Socket no longer readable - break (we got what we could)
+                        break;
+                    } else if (ssl_result == 0) {
+                        // Would-block - track consecutive would-blocks
+                        consecutive_would_block_select++;
+                        
+                        // Check select() again - data might have arrived
+                        FD_ZERO(&read_fds);
+                        FD_SET(ws->fd, &read_fds);
+                        timeout.tv_sec = 0;
+                        timeout.tv_usec = 0;
+                        if (select(ws->fd + 1, &read_fds, NULL, NULL, &timeout) > 0 && FD_ISSET(ws->fd, &read_fds)) {
+                            // Socket still readable - continue trying
+                            consecutive_would_block_select = 0;  // Reset counter
+                            continue;
+                        }
+                        
+                        // Socket no longer readable and SSLRead returns would-block
+                        // This means SecureTransport has no data and socket is empty
+                        if (consecutive_would_block_select >= max_would_block_select) {
+                            // Too many would-blocks - socket is likely empty now
+                            break;
+                        }
+                        // Continue trying a bit more
+                        continue;
+                    } else {
+                        // Error - stop
+                        break;
+                    }
+                }
+            }
+        }
         
         // Process frames first to free buffer space
         process_frames(ws);
         
-        // ULTRA-AGGRESSIVE: Read SSL multiple times even when no events
-        // SecureTransport buffers data internally, so we need to read many times
-        // This is critical for maximum throughput - don't just read once!
-        // CRITICAL: Even when kqueue reports no events, SecureTransport may have buffered data
-        // Read aggressively to catch all buffered data - this is key for high throughput
+        // CRITICAL FIX: Use adaptive polling - poll more aggressively when we're getting data
+        // SecureTransport buffers data internally, and kqueue may not fire immediately when
+        // new data arrives. We need to poll continuously to catch all data.
+        // 
+        // Strategy: Track when we last got SSL data and adjust polling frequency accordingly
+        uint64_t now_ns = get_time_ns();
+        uint64_t time_since_last_data_ns = (ws->last_ssl_data_time_ns > 0) ? 
+            (now_ns - ws->last_ssl_data_time_ns) : UINT64_MAX;
+        
+        // Adaptive limits: poll more aggressively when we're getting data
+        // CRITICAL FIX: For slow connections (like Binance ~1 msg/sec), we need to keep
+        // polling aggressively even when no data has been received recently.
+        // Okx/Bitget work because high message rate keeps polling active.
+        // Binance fails because we reduce polling when idle, missing the next message.
+        // SOLUTION: Keep aggressive polling even when idle, but with longer would-block tolerance
+        int max_no_event_reads;
+        int max_consecutive_would_block;
+        
+        if (time_since_last_data_ns < 100000000ULL) {  // < 100ms since last data
+            // Recent data - poll very aggressively
+            max_no_event_reads = 10000;  // Read up to 10,000 times
+            max_consecutive_would_block = 500;  // Stop after 500 consecutive would-blocks
+        } else if (time_since_last_data_ns < 1000000000ULL) {  // < 1s since last data
+            // Somewhat recent - poll moderately
+            max_no_event_reads = 5000;  // Read up to 5,000 times
+            max_consecutive_would_block = 300;  // Stop after 300 consecutive would-blocks
+        } else {
+            // No data for a while - BUT keep polling aggressively for slow connections
+            // This is critical for Binance which sends ~1 msg/sec
+            // We need to be actively polling when the next message arrives
+            // CRITICAL FIX: Reduce polling when idle to avoid blocking reconnection
+            // But still poll enough to catch messages when they arrive
+            max_no_event_reads = 1000;  // Reduced from 5000 to avoid blocking (still enough for slow connections)
+            max_consecutive_would_block = 50;  // Reduced from 200 to exit faster when no data
+        }
+        
         int no_event_reads = 0;
-        const int max_no_event_reads = 2000;  // Read up to 2000 times when no events (aggressive)
         int consecutive_would_block_no_event = 0;
-        const int max_consecutive_would_block_no_event = 100;  // Stop after 100 consecutive would-blocks
+        bool made_progress = false;
+        
+        // CRITICAL FIX: Add timeout to prevent blocking reconnection
+        // If we've been polling for more than 5ms, exit early to allow reconnection check
+        uint64_t polling_start_ns = get_time_ns();
+        const uint64_t MAX_POLLING_TIME_NS = 5000000ULL;  // 5ms in nanoseconds
         
         while (no_event_reads < max_no_event_reads && ws->state == WS_STATE_CONNECTED) {
+            // Check timeout - exit early if we've been polling too long
+            uint64_t polling_elapsed_ns = get_time_ns() - polling_start_ns;
+            if (polling_elapsed_ns >= MAX_POLLING_TIME_NS) {
+                // Timeout - exit early to allow reconnection check
+                break;
+            }
+            no_event_reads++;
             ssize_t ssl_result = ssl_read(ws->ssl_ctx, &ws->rx_ring);
             
             // Update diagnostic counters
@@ -1373,11 +1537,15 @@ int websocket_process(WebSocket* ws) {
             }
             
             if (ssl_result > 0) {
-                // Got data - reset counters and process immediately
+                // Got data - update timestamp and reset counters
+                ws->last_ssl_data_time_ns = now_ns;
+                made_progress = true;
                 consecutive_would_block_no_event = 0;
+                
+                // Process frames immediately to free buffer space
                 process_frames(ws);
                 
-                // Drain frames aggressively to free buffer space
+                // Drain frames aggressively to free maximum buffer space
                 int frame_iter = 0;
                 while (frame_iter < 500 && ws->state == WS_STATE_CONNECTED) {
                     size_t before = ws->rx_ring.read_ptr;
@@ -1387,27 +1555,16 @@ int websocket_process(WebSocket* ws) {
                     frame_iter++;
                 }
                 
-                // Reset counter - we're getting data, keep going
+                // Reset read counter to allow more reads (we're getting data!)
                 no_event_reads = 0;
                 continue;
-            } else if (ssl_result == 0) {
-                // Would-block - track consecutive would-blocks
-                consecutive_would_block_no_event++;
-                // Process frames before continuing (might have partial frames)
-                process_frames(ws);
-                
-                // Try many more times before giving up
-                if (consecutive_would_block_no_event < max_consecutive_would_block_no_event) {
-                    no_event_reads++;
-                    continue;
-                }
-                break;
             } else if (ssl_result == -2) {
-                // Ring buffer full - process frames aggressively
+                // Ring buffer full - process frames to free space
+                made_progress = true;
                 consecutive_would_block_no_event = 0;
                 process_frames(ws);
                 
-                // Drain frames to free maximum space
+                // Drain frames aggressively
                 int frame_iter = 0;
                 while (frame_iter < 1000 && ws->state == WS_STATE_CONNECTED) {
                     size_t before = ws->rx_ring.read_ptr;
@@ -1416,11 +1573,54 @@ int websocket_process(WebSocket* ws) {
                     if (after == before) break;
                     frame_iter++;
                 }
-                // Reset counter - freed space, keep going
+                
+                // Reset read counter to allow more reads after freeing space
                 no_event_reads = 0;
+                continue;
+            } else if (ssl_result == 0) {
+                // Would-block - track consecutive would-blocks
+                consecutive_would_block_no_event++;
+                
+                // Process frames before continuing
+                process_frames(ws);
+                
+                // CRITICAL FIX: Check select() during polling loop to detect new data
+                // This catches messages that arrive while we're in the polling loop
+                // This is especially important for slow connections like Binance
+                if (ws->fd >= 0 && (consecutive_would_block_no_event % 10 == 0)) {
+                    // Check select() every 10 would-blocks to see if new data arrived
+                    fd_set read_fds_check;
+                    struct timeval timeout_check;
+                    FD_ZERO(&read_fds_check);
+                    FD_SET(ws->fd, &read_fds_check);
+                    timeout_check.tv_sec = 0;
+                    timeout_check.tv_usec = 0;
+                    
+                    if (select(ws->fd + 1, &read_fds_check, NULL, NULL, &timeout_check) > 0 && 
+                        FD_ISSET(ws->fd, &read_fds_check)) {
+                        // New data available! Reset counters and continue reading
+                        consecutive_would_block_no_event = 0;
+                        made_progress = true;
+                        continue;  // Try reading again
+                    }
+                }
+                
+                // Adaptive stopping: if we made progress recently, be more patient
+                if (made_progress && consecutive_would_block_no_event < max_consecutive_would_block / 2) {
+                    // Reset counter if we made progress - SecureTransport may have more data
+                    consecutive_would_block_no_event = 0;
+                }
+                
+                // Only stop after many consecutive would-blocks
+                if (consecutive_would_block_no_event >= max_consecutive_would_block) {
+                    // Too many consecutive would-blocks - likely no more data right now
+                    break;
+                }
+                // Continue trying - SecureTransport may have more data
                 continue;
             } else {
                 // Error - stop
+                WS_LOG(ws, WS_LOG_WARN, "websocket_process: SSL read error in no-event polling: %zd", ssl_result);
                 break;
             }
         }
@@ -1814,7 +2014,6 @@ static void check_heartbeat(WebSocket* ws) {
                 io_write(ws->io_ctx, ws->socket_index);
             }
             ws->last_ping_sent_ns = now_ns;
-            WS_LOG(ws, WS_LOG_DEBUG, "Sent heartbeat ping");
         }
     }
     
