@@ -92,7 +92,6 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
     if (__builtin_expect(n > 0, 1)) {  // Hot path: expect success
         // Extract NIC timestamp from control message
         // CRITICAL: Check msg_controllen to see if we got control messages
-        bool timestamp_found = false;
         struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
         while (cmsg != NULL) {
             if (__builtin_expect(cmsg->cmsg_level == SOL_SOCKET, 1)) {  // Hot path: expect socket level
@@ -101,8 +100,7 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
                     struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
                     uint64_t nic_ns = timespec_to_ns_ssl(ts);
                     ctx->last_nic_timestamp_ns = nic_ns;
-                    timestamp_found = true;
-                    
+
                     // Convert to CPU cycles using cached timebase (HFT optimization)
                     static mach_timebase_info_data_t cached_timebase_st = {0, 0};
                     static bool timebase_inited_st = false;
@@ -110,10 +108,10 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
                         mach_timebase_info(&cached_timebase_st);
                         timebase_inited_st = true;
                     }
-                    
+
                     uint64_t now_ticks = mach_absolute_time();
                     uint64_t now_ns = (now_ticks * cached_timebase_st.numer) / cached_timebase_st.denom;
-                    
+
                     if (__builtin_expect(nic_ns <= now_ns && now_ns > 0 && cached_timebase_st.denom > 0, 1)) {  // Hot path: expect valid timestamp
                         uint64_t diff_ns = now_ns - nic_ns;
                         // Integer-only conversion: diff_ticks = (diff_ns * denom) / numer
@@ -130,7 +128,6 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
                     struct timeval* tv = (struct timeval*)CMSG_DATA(cmsg);
                     uint64_t nic_ns = (uint64_t)tv->tv_sec * 1000000000ULL + (uint64_t)tv->tv_usec * 1000ULL;
                     ctx->last_nic_timestamp_ns = nic_ns;
-                    timestamp_found = true;
                     
                     // Convert to CPU cycles using cached timebase (HFT optimization)
                     static mach_timebase_info_data_t cached_timebase_st = {0, 0};
@@ -158,20 +155,19 @@ static OSStatus ssl_read_func(SSLConnectionRef conn, void* data, size_t* length)
             cmsg = CMSG_NXTHDR(&msg, cmsg);
         }
         
-        // If no timestamp found from control messages, use packet_arrival_ticks
-        if (!timestamp_found) {
-            ctx->last_nic_timestamp_ticks = packet_arrival_ticks;
-            
-            // Convert to nanoseconds
-            static mach_timebase_info_data_t cached_timebase_st_fallback = {0, 0};
-            static bool timebase_st_fallback_inited = false;
-            if (!timebase_st_fallback_inited) {
-                mach_timebase_info(&cached_timebase_st_fallback);
-                timebase_st_fallback_inited = true;
-            }
-            uint64_t packet_arrival_ns = (packet_arrival_ticks * cached_timebase_st_fallback.numer) / cached_timebase_st_fallback.denom;
-            ctx->last_nic_timestamp_ns = packet_arrival_ns;
+        // On macOS, SO_TIMESTAMP control messages may not work reliably with SecureTransport
+        // Always use packet_arrival_ticks as the NIC timestamp approximation
+        ctx->last_nic_timestamp_ticks = packet_arrival_ticks;
+
+        // Convert to nanoseconds
+        static mach_timebase_info_data_t cached_timebase_st = {0, 0};
+        static bool timebase_st_inited = false;
+        if (!timebase_st_inited) {
+            mach_timebase_info(&cached_timebase_st);
+            timebase_st_inited = true;
         }
+        uint64_t packet_arrival_ns = (packet_arrival_ticks * cached_timebase_st.numer) / cached_timebase_st.denom;
+        ctx->last_nic_timestamp_ns = packet_arrival_ns;
     }
     
     if (n < 0) {

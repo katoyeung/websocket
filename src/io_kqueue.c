@@ -126,6 +126,10 @@ int io_add_socket(IOContext* ctx, int fd, RingBuffer* rx_ring, RingBuffer* tx_ri
         // Try SO_TIMESTAMP as fallback
         setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp, sizeof(timestamp));
     }
+
+    // FUTURE: Enable hardware timestamping if NIC supports it
+    // This would require ioctl() calls to configure NIC hardware timestamping
+    // and is typically only available on server-grade NICs with PTP support
     
     // Register socket in our array
     int idx = ctx->socket_count++;

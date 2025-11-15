@@ -758,6 +758,41 @@ int websocket_connect(WebSocket* ws, const char* url, bool disable_cert_validati
         return -1;
     }
     
+    // CRITICAL FIX: Clean up existing resources ONLY if reconnecting
+    // On first connect (WS_STATE_CLOSED), skip cleanup to avoid breaking connection
+    if (ws->state == WS_STATE_CONNECTED || ws->state == WS_STATE_CONNECTING) {
+        // Close existing connection first (this will clean up SSL, I/O, and close socket)
+        websocket_close(ws);
+        // websocket_close() sets state to CLOSED, but doesn't clean up ring buffers
+        // So we need to clean them up here to prevent memory leak on reconnection
+        if (ws->rx_ring.buf) {
+            ringbuffer_cleanup(&ws->rx_ring);
+        }
+        if (ws->tx_ring.buf) {
+            ringbuffer_cleanup(&ws->tx_ring);
+        }
+        // Clean up I/O context and SSL context from previous connection
+        if (ws->io_ctx) {
+            io_cleanup(ws->io_ctx);
+            free(ws->io_ctx);
+            ws->io_ctx = NULL;
+        }
+        if (ws->ssl_ctx) {
+            ssl_cleanup(ws->ssl_ctx);
+            ws->ssl_ctx = NULL;
+        }
+        if (ws->fd >= 0) {
+            close(ws->fd);
+            ws->fd = -1;
+        }
+        if (ws->url) {
+            free(ws->url);
+            ws->url = NULL;
+        }
+        // Reset socket_index to prevent stale references
+        ws->socket_index = -1;
+    }
+    
     ws->url = strdup(url);
     ws->cert_validation_disabled = disable_cert_validation;
     
@@ -811,13 +846,13 @@ int websocket_connect(WebSocket* ws, const char* url, bool disable_cert_validati
         if (ssl_init(&ws->ssl_ctx, disable_cert_validation) != 0) {
             goto cleanup;
         }
-        
+
         if (ssl_connect(ws->ssl_ctx, ws->fd, ws->host) != 0) {
             ssl_cleanup(ws->ssl_ctx);
             ws->ssl_ctx = NULL;
             goto cleanup;
         }
-        
+
         // Set user_data in SSL context for diagnostic tracking
         ssl_set_user_data(ws->ssl_ctx, ws);
     }
@@ -845,6 +880,10 @@ cleanup:
     if (ws->fd >= 0) {
         close(ws->fd);
         ws->fd = -1;
+    }
+    if (ws->ssl_ctx) {
+        ssl_cleanup(ws->ssl_ctx);
+        ws->ssl_ctx = NULL;
     }
     if (ws->io_ctx) {
         io_cleanup(ws->io_ctx);
